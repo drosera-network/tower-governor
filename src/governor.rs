@@ -2,6 +2,7 @@ use crate::{
     key_extractor::{KeyExtractor, PeerIpKeyExtractor},
     GovernorError,
 };
+#[cfg(feature = "axum")]
 use axum::body::Body;
 use governor::{
     clock::{DefaultClock, QuantaInstant},
