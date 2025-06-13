@@ -159,16 +159,9 @@ fn maybe_forwarded(headers: &HeaderMap) -> Option<IpAddr> {
     })
 }
 
-#[cfg(feature = "axum")]
 /// Looks in `ConnectInfo` extension
 fn maybe_connect_info<T>(req: &Request<T>) -> Option<IpAddr> {
     req.extensions()
-        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+        .get::<SocketAddr>()
         .map(|addr| addr.ip())
-}
-
-#[cfg(not(feature = "axum"))]
-/// Looks in `ConnectInfo` extension
-fn maybe_connect_info<T>(req: &Request<T>) -> Option<IpAddr> {
-    req.extensions().get::<SocketAddr>().map(|addr| addr.ip())
 }

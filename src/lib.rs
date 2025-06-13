@@ -9,19 +9,20 @@ pub mod key_extractor;
 use crate::governor::{Governor, GovernorConfig};
 use ::governor::clock::{Clock, DefaultClock, QuantaInstant};
 use ::governor::middleware::{NoOpMiddleware, RateLimitingMiddleware, StateInformationMiddleware};
-use axum::body::Body;
-pub use errors::GovernorError;
-use http::response::Response;
 
+pub use errors::GovernorError;
 use http::header::{HeaderName, HeaderValue};
-use http::request::Request;
 use http::HeaderMap;
+use hyper::body::Incoming;
+use hyper::Request;
+use hyper::Response;
 use key_extractor::KeyExtractor;
 use pin_project::pin_project;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::{future::Future, pin::Pin, task::ready};
 use tower::{Layer, Service};
+use jsonrpsee::http_client::HttpBody;
 
 /// The Layer type that implements tower::Layer and is passed into `.layer()`
 pub struct GovernorLayer<K, M>
@@ -53,10 +54,11 @@ impl<K: KeyExtractor, M: RateLimitingMiddleware<QuantaInstant>> Clone for Govern
     }
 }
 // Implement tower::Service for Governor
-impl<K, S, ReqBody> Service<Request<ReqBody>> for Governor<K, NoOpMiddleware, S>
+impl<K, S> Service<Request<Incoming>> for Governor<K, NoOpMiddleware, S>
 where
     K: KeyExtractor,
-    S: Service<Request<ReqBody>, Response = Response<Body>>,
+    S: Service<Request<Incoming>, Response = Response<HttpBody>>,
+    S::Error: Into<BoxError>,
 {
     type Response = S::Response;
     type Error = S::Error;
@@ -66,7 +68,7 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
+    fn call(&mut self, req: Request<Incoming>) -> Self::Future {
         if let Some(configured_methods) = &self.methods {
             if !configured_methods.contains(req.method()) {
                 // The request method is not configured, we're ignoring this one.
@@ -105,28 +107,33 @@ where
                             &wait_time
                         );
                     }
-                    let mut headers = HeaderMap::new();
-                    headers.insert("x-ratelimit-after", wait_time.into());
-                    headers.insert("retry-after", wait_time.into());
-
-                    let error_response = self.error_handler()(GovernorError::TooManyRequests {
-                        wait_time,
-                        headers: Some(headers),
-                    });
+                    
+                    let body = HttpBody::from("Too many requests".to_string());
+                    let response = Response::builder()
+                      .status(429)      
+                      .header("x-ratelimit-after", wait_time.to_string())        
+                      .body(body)
+                      .unwrap();
 
                     ResponseFuture {
                         inner: Kind::Error {
-                            error_response: Some(error_response),
+                            error_response: Some(response),
                         },
                     }
                 }
             },
 
             Err(e) => {
-                let error_response = self.error_handler()(e);
+                let body = HttpBody::from(e.to_string());
+                let response = Response::builder()
+                  .status(500)              
+                  .body(body)
+                  .unwrap();
+                
+              
                 ResponseFuture {
                     inner: Kind::Error {
-                        error_response: Some(error_response),
+                        error_response: Some(response),
                     },
                 }
             }
@@ -162,15 +169,17 @@ enum Kind<F> {
         future: F,
     },
     Error {
-        error_response: Option<Response<Body>>,
+        error_response: Option<Response<HttpBody>>
     },
 }
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-impl<F, E> Future for ResponseFuture<F>
+impl<F, Error> Future for ResponseFuture<F>
 where
-    F: Future<Output = Result<Response<Body>, E>>,
+    F: Future<Output = Result<Response<HttpBody>, Error>>,
+    Error: Into<BoxError>
 {
-    type Output = Result<Response<Body>, E>;
+    type Output = Result<Response<HttpBody>, Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match self.project().inner.project() {
@@ -192,6 +201,7 @@ where
                     HeaderValue::from(*remaining_burst_capacity),
                 );
                 response.headers_mut().extend(headers.drain());
+   
 
                 Poll::Ready(Ok(response))
             }
@@ -206,20 +216,26 @@ where
 
                 Poll::Ready(Ok(response))
             }
-            KindProj::Error { error_response } => Poll::Ready(Ok(error_response.take().expect("
-                <Governor as Service<Request<_>>>::call must produce Response<String> when GovernorError occurs.
-            "))),
+            KindProj::Error { error_response } => {
+              let error = error_response.as_ref().unwrap();
+              let body = HttpBody::from("Too many requests".to_string());
+              let response = Response::builder()
+                .status(error.status())              
+                .body(body)
+                .unwrap();
+              
+              Poll::Ready(Ok(response))
+            },
         }
     }
 }
 
 // Implementation of Service for Governor using the StateInformationMiddleware.
-impl<K, S, ReqBody> Service<Request<ReqBody>> for Governor<K, StateInformationMiddleware, S>
+impl<K, S> Service<Request<Incoming>> for Governor<K, StateInformationMiddleware, S>
 where
     K: KeyExtractor,
-    S: Service<Request<ReqBody>, Response = Response<Body>>,
-    // Body type of response must impl From<String> trait to convert potential error
-    // produced by governor to re
+    S: Service<Request<Incoming>, Response = Response<HttpBody>>,
+    S::Error: Into<BoxError>,
 {
     type Response = S::Response;
     type Error = S::Error;
@@ -231,7 +247,7 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
+    fn call(&mut self, req: Request<Incoming>) -> Self::Future {
         if let Some(configured_methods) = &self.methods {
             if !configured_methods.contains(req.method()) {
                 // The request method is not configured, we're ignoring this one.
@@ -275,23 +291,19 @@ where
                         );
                     }
 
-                    let mut headers = HeaderMap::new();
-                    headers.insert("x-ratelimit-after", wait_time.into());
-                    headers.insert("retry-after", wait_time.into());
-                    headers.insert(
-                        "x-ratelimit-limit",
-                        negative.quota().burst_size().get().into(),
-                    );
-                    headers.insert("x-ratelimit-remaining", 0.into());
 
-                    let error_response = self.error_handler()(GovernorError::TooManyRequests {
-                        wait_time,
-                        headers: Some(headers),
-                    });
+                    let body = HttpBody::from("Too many requests".to_string());
+                    let response = Response::builder()
+                      .status(429)      
+                      .header("x-ratelimit-after", wait_time.to_string())
+                      .header("x-ratelimit-limit", negative.quota().burst_size().get().to_string())
+                      .header("x-ratelimit-remaining", "0")
+                      .body(body)
+                      .unwrap();
 
                     ResponseFuture {
                         inner: Kind::Error {
-                            error_response: Some(error_response),
+                            error_response: Some(response),
                         },
                     }
                 }
@@ -299,10 +311,15 @@ where
 
             // Extraction failed, stop right now.
             Err(e) => {
-                let error_response = self.error_handler()(e);
+              let body = HttpBody::from(e.to_string());
+              let response = Response::builder()
+                .status(500)              
+                .body(body)
+                .unwrap();
+              
                 ResponseFuture {
                     inner: Kind::Error {
-                        error_response: Some(error_response),
+                        error_response: Some(response),
                     },
                 }
             }
